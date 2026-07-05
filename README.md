@@ -1,4 +1,4 @@
-# OpenTelemetry & Google ADK GCP Telemetry PoC
+# GCP OpenTelemetry LLM Agent
 
 This repository serves as a Proof of Concept (PoC) demonstrating how to emit custom metrics, distributed traces, and application logs from a Google Agent Development Kit (ADK) agent to Google Cloud (Stackdriver) using OpenTelemetry.
 
