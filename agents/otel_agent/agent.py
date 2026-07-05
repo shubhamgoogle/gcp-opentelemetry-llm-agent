@@ -1,11 +1,13 @@
 import re
 import uuid
 
-# OpenTelemetry imports
-from opentelemetry import metrics
+from opentelemetry import metrics, trace
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader, ConsoleMetricExporter
 from opentelemetry.exporter.cloud_monitoring import CloudMonitoringMetricsExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter, SimpleSpanProcessor
+from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
 
 # Google ADK imports
 from google.adk.agents import Agent
@@ -21,12 +23,29 @@ gcp_exporter = CloudMonitoringMetricsExporter()
 console_exporter = ConsoleMetricExporter()
 
 # We can attach multiple readers to the MeterProvider
-gcp_reader = PeriodicExportingMetricReader(gcp_exporter, export_interval_millis=60000)
-console_reader = PeriodicExportingMetricReader(console_exporter, export_interval_millis=60000)
+gcp_reader = PeriodicExportingMetricReader(gcp_exporter, export_interval_millis=5000)
+console_reader = PeriodicExportingMetricReader(console_exporter, export_interval_millis=5000)
 
 provider = MeterProvider(metric_readers=[gcp_reader, console_reader])
 metrics.set_meter_provider(provider)
 meter = metrics.get_meter("google_adk_telemetry_poc")
+
+# =========================================================================
+# Phase 1b: Tracing Setup
+# =========================================================================
+gcp_trace_exporter = CloudTraceSpanExporter(project_id="deepspace-460917")
+console_trace_exporter = ConsoleSpanExporter()
+
+# Do NOT create a new TracerProvider as ADK has already set one!
+# Overriding it fails silently with a WARNING and drops our exporters.
+provider = trace.get_tracer_provider()
+if hasattr(provider, "add_span_processor"):
+    provider.add_span_processor(SimpleSpanProcessor(gcp_trace_exporter))
+    provider.add_span_processor(SimpleSpanProcessor(console_trace_exporter))
+else:
+    print("WARNING: Current TracerProvider does not support adding span processors directly.")
+
+tracer = trace.get_tracer("google_adk_telemetry_poc_tracer")
 
 vowel_counter = meter.create_counter(
     name="agent.prompt.vowel_count",
@@ -47,6 +66,9 @@ def count_vowels(text: str) -> int:
 # so the after_model callback can use the same run_id as before_agent
 run_ids = {}
 
+# We also map invocation IDs to active spans for tracing
+active_spans = {}
+
 # =========================================================================
 # Phase 2: Callbacks
 # =========================================================================
@@ -61,24 +83,50 @@ async def before_agent_cb(callback_context: CallbackContext, **kwargs) -> types.
             run_id = str(uuid.uuid4())
             run_ids[callback_context.invocation_id] = run_id
             
+            # Start tracing span
+            span = tracer.start_span("agent_execution")
+            span.set_attribute("agent.name", "demo_otel_agent")
+            span.set_attribute("agent.run_id", run_id)
+            span.set_attribute("user.prompt", prompt)
+            active_spans[callback_context.invocation_id] = span
+            
             # Emit "before" metric
-            vowel_counter.add(vowels, {"agent_name": "basic_otel_agent", "run_id": run_id})
+            vowel_counter.add(vowels, {"agent_name": "demo_otel_agent", "run_id": run_id})
             print("Number of vowels: ", vowels)
+            print(f"Started trace with Trace ID: {span.get_span_context().trace_id:032x}")
     return None
 
 async def after_model_cb(callback_context: CallbackContext, response: LlmResponse = None, **kwargs) -> LlmResponse | None:
     """Triggered after the LLM model responds, before returning to user."""
+    
+    print(f"after_model_cb triggered for invocation: {callback_context.invocation_id}")
+    
+    # Always pop and end the span to prevent it from hanging forever
+    span = active_spans.pop(callback_context.invocation_id, None)
+    
+    response_length = 0
     if response and getattr(response, "content", None) and getattr(response.content, "parts", None):
-        response_text = getattr(response.content.parts[0], "text", "")
+        # Depending on the GenAI SDK version, text might be accessed differently
+        try:
+            response_text = response.content.parts[0].text
+        except AttributeError:
+            response_text = ""
+            
         if response_text:
             response_length = len(response_text)
             
-            # Retrieve run_id to link metrics, default to a new one if not found
-            run_id = run_ids.get(callback_context.invocation_id, str(uuid.uuid4()))
+    if span:
+        if response_length > 0:
+            span.set_attribute("response.length", response_length)
+        span.end()
+        print(f"Ended trace with Trace ID: {span.get_span_context().trace_id:032x}. Trace successfully recorded!")
+    else:
+        print(f"WARNING: No active span found for invocation: {callback_context.invocation_id}")
             
-            # Emit "after" metric
-            char_length_histogram.record(response_length, {"agent_name": "basic_otel_agent", "run_id": run_id})
-            print("Response length: ", response_length)
+    if response_length > 0:
+        run_id = run_ids.get(callback_context.invocation_id, str(uuid.uuid4()))
+        char_length_histogram.record(response_length, {"agent_name": "demo_otel_agent", "run_id": run_id})
+        
     return response
 
 # =========================================================================
