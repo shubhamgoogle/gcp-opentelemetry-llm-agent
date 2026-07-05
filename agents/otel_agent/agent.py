@@ -8,6 +8,11 @@ from opentelemetry.exporter.cloud_monitoring import CloudMonitoringMetricsExport
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter, SimpleSpanProcessor
 from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
+import logging
+from opentelemetry._logs import get_logger_provider, set_logger_provider
+from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+from opentelemetry.exporter.cloud_logging import CloudLoggingExporter
 
 # Google ADK imports
 from google.adk.agents import Agent
@@ -40,12 +45,30 @@ console_trace_exporter = ConsoleSpanExporter()
 # Overriding it fails silently with a WARNING and drops our exporters.
 provider = trace.get_tracer_provider()
 if hasattr(provider, "add_span_processor"):
-    provider.add_span_processor(SimpleSpanProcessor(gcp_trace_exporter))
-    provider.add_span_processor(SimpleSpanProcessor(console_trace_exporter))
+    provider.add_span_processor(BatchSpanProcessor(gcp_trace_exporter))
+    provider.add_span_processor(BatchSpanProcessor(console_trace_exporter))
 else:
     print("WARNING: Current TracerProvider does not support adding span processors directly.")
 
 tracer = trace.get_tracer("google_adk_telemetry_poc_tracer")
+
+# =========================================================================
+# Phase 1c: Logging Setup
+# =========================================================================
+gcp_log_exporter = CloudLoggingExporter(project_id="deepspace-460917")
+log_provider = get_logger_provider()
+
+if hasattr(log_provider, "add_log_record_processor"):
+    log_provider.add_log_record_processor(BatchLogRecordProcessor(gcp_log_exporter))
+else:
+    new_provider = LoggerProvider()
+    new_provider.add_log_record_processor(BatchLogRecordProcessor(gcp_log_exporter))
+    set_logger_provider(new_provider)
+    log_provider = new_provider
+
+# Route Python's standard logging to OpenTelemetry
+otel_handler = LoggingHandler(level=logging.INFO, logger_provider=log_provider)
+logging.getLogger().addHandler(otel_handler)
 
 vowel_counter = meter.create_counter(
     name="agent.prompt.vowel_count",
@@ -92,6 +115,7 @@ async def before_agent_cb(callback_context: CallbackContext, **kwargs) -> types.
             
             # Emit "before" metric
             vowel_counter.add(vowels, {"agent_name": "demo_otel_agent", "run_id": run_id})
+            logging.info(f"Agent starts execution for run_id {run_id} with prompt containing {vowels} vowels.")
             print("Number of vowels: ", vowels)
             print(f"Started trace with Trace ID: {span.get_span_context().trace_id:032x}")
     return None
@@ -119,8 +143,10 @@ async def after_model_cb(callback_context: CallbackContext, response: LlmRespons
         if response_length > 0:
             span.set_attribute("response.length", response_length)
         span.end()
+        logging.info(f"Trace ended successfully for trace_id {span.get_span_context().trace_id:032x} with response length {response_length}.")
         print(f"Ended trace with Trace ID: {span.get_span_context().trace_id:032x}. Trace successfully recorded!")
     else:
+        logging.warning(f"No active span found for invocation: {callback_context.invocation_id}")
         print(f"WARNING: No active span found for invocation: {callback_context.invocation_id}")
             
     if response_length > 0:
